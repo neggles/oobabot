@@ -4,7 +4,7 @@
 
 import asyncio
 from copy import deepcopy
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator
 from urllib.parse import urljoin
 
 import aiohttp
