@@ -2,15 +2,12 @@
 # Can provide the response by token or by sentence.
 #
 
-from asyncio.exceptions import TimeoutError
-import json
-from socket import gaierror
-import typing
+import asyncio
+from copy import deepcopy
+from typing import AsyncIterator, Optional
 from urllib.parse import urljoin
 
-# todo: move to aiohttp to reduce dependencies
-import websockets as ws  # weird, but needed to avoid long lines later
-from websockets.exceptions import WebSocketException
+import aiohttp
 
 from oobabot.sentence_splitter import SentenceSplitter
 
@@ -23,14 +20,8 @@ class OobaClient:
     # Purpose: Streaming client for the Ooba API.
     # Can provide the response by token or by sentence.
 
+    STREAMING_URI_PATH = "/api/v1/stream"
     END_OF_INPUT = ""
-
-    def __init__(self, base_url: str):
-        # connector = aiohttp.TCPConnector(limit_per_host=1)
-
-        self.api_url = urljoin(base_url, self.STREAMING_URI_PATH)
-        self.total_response_tokens = 0
-
     DEFAULT_REQUEST_PARAMS = {
         "max_new_tokens": 250,
         "do_sample": True,
@@ -53,7 +44,17 @@ class OobaClient:
         "stopping_strings": [],
     }
 
-    STREAMING_URI_PATH = "./api/v1/stream"
+    def __init__(self, base_url: str):
+        # connector = aiohttp.TCPConnector(limit_per_host=1)
+
+        self.api_url = urljoin(base_url, self.STREAMING_URI_PATH)
+        self.total_response_tokens = 0
+        self.session = aiohttp.ClientSession()
+
+    def __del__(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self.session.close())
+        loop.run_until_complete(asyncio.sleep(0))  # allows aiohttp to clean up
 
     async def try_connect(self):
         """
@@ -66,17 +67,13 @@ class OobaClient:
             OobaClientError, if the connection fails
         """
         try:
-            async with ws.connect(self.api_url):  # type: ignore
-                return
-        except (
-            ConnectionRefusedError,
-            gaierror,
-            TimeoutError,
-            WebSocketException,
-        ) as e:
+            async with self.session.ws_connect(self.api_url) as websocket:
+                return await websocket.close()
+
+        except (ConnectionRefusedError, TimeoutError, aiohttp.WebSocketError) as e:
             raise OobaClientError(f"Failed to connect to {self.api_url}: {e}", e)
 
-    async def request_by_sentence(self, prompt: str) -> typing.AsyncIterator[str]:
+    async def request_by_sentence(self, prompt: str) -> AsyncIterator[str]:
         """
         Yields each complete sentence of the response as it arrives.
         """
@@ -86,29 +83,23 @@ class OobaClient:
             for sentence in splitter.by_sentence(new_token):
                 yield sentence
 
-    async def request_by_token(self, prompt: str) -> typing.AsyncIterator[str]:
+    async def request_by_token(self, prompt: str) -> AsyncIterator[str]:
         """
         Yields each token of the response as it arrives.
         """
+        request = deepcopy(self.DEFAULT_REQUEST_PARAMS)
+        request["prompt"] = prompt
 
-        request = {
-            "prompt": prompt,
-        }
-        request.update(self.DEFAULT_REQUEST_PARAMS)
-
-        async with ws.connect(self.api_url) as websocket:  # type: ignore
-            await websocket.send(json.dumps(request))
-
-            while True:
-                incoming_data = await websocket.recv()
-                incoming_data = json.loads(incoming_data)
-
-                if "text_stream" == incoming_data["event"]:
-                    if incoming_data["text"]:
-                        self.total_response_tokens += 1
-                        yield incoming_data["text"]
-
-                elif "stream_end" == incoming_data["event"]:
-                    # Make sure any unprinted text is flushed.
-                    yield self.END_OF_INPUT
-                    return
+        async with self.session.ws_connect(self.api_url) as websocket:
+            await websocket.send_json(request)
+            async for payload in websocket.receive_json():
+                match payload["event"]:
+                    case "text_stream":
+                        if payload["text"]:
+                            self.total_response_tokens += 1
+                            yield payload["text"]
+                    case "stream_end":
+                        yield self.END_OF_INPUT
+                        return
+                    case _:
+                        raise OobaClientError(f"Unexpected event: {payload}")
